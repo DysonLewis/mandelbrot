@@ -87,13 +87,12 @@ def worker(input, output, lut_shared, color_max_shared):
         del coldata, chunk_normalized
 
 
-def feeder(input):
-    '''Feeder process that creates work chunks and queues them for workers'''
+def feeder(input, strip_y_start, strip_y_end):
+    '''Feeder process that creates work chunks for a specific strip'''
     for i in range(nc):
-        xx, yy = np.meshgrid(x[bx[i]:ex[i]], y)
+        xx, yy = np.meshgrid(x[bx[i]:ex[i]], y[strip_y_start:strip_y_end])
         args = (xx, yy)
         input.put((i, args), True)
-    _log.debug('feeder finished')
 
 
 def create_dzi_file(width, height, tile_size, tile_overlap, dzi_path):
@@ -127,38 +126,6 @@ def get_level_dimensions(width, height, level, max_level):
     level_width = max(1, int(math.ceil(width / scale)))
     level_height = max(1, int(math.ceil(height / scale)))
     return level_width, level_height
-
-
-def process_strip_worker(args):
-    '''Worker function to process one strip and save tiles'''
-    strip_idx, strip_y_start, strip_y_end, strip_height, nx, bx, ex, nc, tiles_dir, max_level, strips_per_height = args
-    
-    # Build strip by loading only needed portions from chunks
-    strip_buffer = np.zeros((strip_height, nx, 3), dtype=np.uint8)
-    
-    for i in range(nc):
-        chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
-        # Memory-map the chunk file to avoid loading entire chunk
-        chunk_mmap = np.load(chunk_file, mmap_mode='r')
-        # Copy only the needed strip portion
-        strip_buffer[:, bx[i]:ex[i], :] = chunk_mmap[strip_y_start:strip_y_end, :, :]
-        del chunk_mmap
-    
-    # Flip vertically using C++ extension
-    strip_buffer = image_processor.flip_vertical(strip_buffer)
-    
-    # Split into tiles using C++ extension
-    tiles = image_processor.split_into_tiles(strip_buffer, TILE_SIZE)
-    del strip_buffer
-    
-    # Save tiles
-    tiles_per_width = len(tiles)
-    tile_row = strips_per_height - 1 - strip_idx
-    
-    for tile_x_idx, tile_data in enumerate(tiles):
-        save_tile(tile_data, max_level, tile_x_idx, tile_row, tiles_dir)
-    
-    return strip_idx
 
 
 def downsample_tile_worker(args):
@@ -234,89 +201,96 @@ if __name__ == '__main__':
     max_level = int(math.ceil(math.log(max(nx, ny), 2)))
     _log.info(f'DeepZoom pyramid will have {max_level + 1} levels')
     
+    # Calculate strip parameters
+    strips_per_height = int(math.ceil(ny / TILE_SIZE))
+    
+    _log.info(f'Processing image in {strips_per_height} strips')
+    
     # Setup multiprocessing queues and processes
     n_process = mp.cpu_count()
     n_max = n_process*2
-    inqueue = mp.Queue(n_max)
-    outqueue = mp.Queue(n_max)
-
-    # Start worker processes to compute Mandelbrot chunks
-    for i in range(n_process):
-        mp.Process(target=worker, args=(inqueue, outqueue, lut_shared, color_max_shared)).start()
-
-    # Start feeder process to generate work
-    feedp = mp.Process(target=feeder, args=(inqueue,))
-    feedp.start()
-    
-    _log.info('Phase 1: Computing chunks and writing max-resolution tiles')
-    
-    # We'll build the full-resolution image in horizontal strips to save tiles
-    # Allocate buffer for one strip of tiles (height = TILE_SIZE)
-    strips_per_height = int(math.ceil(ny / TILE_SIZE))
-    current_strip = np.zeros((TILE_SIZE, nx, 3), dtype=np.uint8)
-    strip_fill_height = 0
-    current_strip_idx = 0
-    
-    # Process chunks and accumulate into strips
-    chunk_files = {}
-    with tqdm(total=nc, desc="Computing chunks", unit="chunk") as pbar:
-        for j in range(nc):
-            i, rgb_chunk = outqueue.get()
-            
-            # Store chunk in the appropriate position
-            # For now, save chunks to temp files since they come out of order
-            chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
-            np.save(chunk_file, rgb_chunk)
-            chunk_files[i] = chunk_file
-            
-            del rgb_chunk
-            pbar.update(1)
-            
-            if (j + 1) % 10 == 0:
-                gc.collect()
-    
-    # Clean up worker processes
-    _log.debug('received all chunks; killing workers')
-    for i in range(n_process):
-        inqueue.put('STOP')
-    
-    _log.debug('waiting for feeder to finish')
-    feedp.join(1.)
-    
-    _log.info('All chunks computed, now assembling and saving tiles')
     
     level_dir = os.path.join(tiles_dir, str(max_level))
     os.makedirs(level_dir, exist_ok=True)
     
-    # Build full image strip by strip and save tiles in parallel
-    strips_to_process = []
-    for strip_idx in range(strips_per_height):
-        strip_y_start = strip_idx * TILE_SIZE
-        strip_y_end = min((strip_idx + 1) * TILE_SIZE, ny)
-        strip_height = strip_y_end - strip_y_start
-        
-        strips_to_process.append((
-            strip_idx, strip_y_start, strip_y_end, strip_height, 
-            nx, bx, ex, nc, tiles_dir, max_level, strips_per_height
-        ))
+    # Process one strip at a time
+    with tqdm(total=strips_per_height, desc="Processing strips", unit="strip") as pbar:
+        for strip_idx in range(strips_per_height):
+            strip_y_start = strip_idx * TILE_SIZE
+            strip_y_end = min((strip_idx + 1) * TILE_SIZE, ny)
+            strip_height = strip_y_end - strip_y_start
+            
+            # Create fresh queues for this strip
+            inqueue = mp.Queue(n_max)
+            outqueue = mp.Queue(n_max)
+            
+            # Start worker processes for this strip
+            workers = []
+            for i in range(n_process):
+                p = mp.Process(target=worker, args=(inqueue, outqueue, lut_shared, color_max_shared))
+                p.start()
+                workers.append(p)
+            
+            # Start feeder process for this strip
+            feedp = mp.Process(target=feeder, args=(inqueue, strip_y_start, strip_y_end))
+            feedp.start()
+            
+            # Collect chunks and save as temporary .npy files
+            chunk_files = []
+            for j in range(nc):
+                i, rgb_chunk = outqueue.get()
+                
+                # Save chunk temporarily
+                chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+                np.save(chunk_file, rgb_chunk)
+                chunk_files.append((i, chunk_file))
+                
+                del rgb_chunk
+                
+                if (j + 1) % 10 == 0:
+                    gc.collect()
+            
+            # Clean up workers for this strip
+            for i in range(n_process):
+                inqueue.put('STOP')
+            for p in workers:
+                p.join()
+            feedp.join(1.)
+            
+            # Build strip from chunks (using mmap to avoid loading everything)
+            strip_buffer = np.zeros((strip_height, nx, 3), dtype=np.uint8)
+            
+            for i in range(nc):
+                chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+                # Memory-map the chunk file to avoid loading entire chunk
+                chunk_mmap = np.load(chunk_file, mmap_mode='r')
+                strip_buffer[:, bx[i]:ex[i], :] = chunk_mmap[:, :, :]
+                del chunk_mmap
+            
+            # Flip vertically using C++ extension
+            strip_buffer = image_processor.flip_vertical(strip_buffer)
+            
+            # Split into tiles using C++ extension
+            tiles = image_processor.split_into_tiles(strip_buffer, TILE_SIZE)
+            del strip_buffer
+            
+            # Save tiles for this strip
+            tile_row = strips_per_height - 1 - strip_idx
+            for tile_x_idx, tile_data in enumerate(tiles):
+                save_tile(tile_data, max_level, tile_x_idx, tile_row, tiles_dir)
+            
+            del tiles
+            
+            # Delete temporary chunk files for this strip
+            for i in range(nc):
+                chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+                if os.path.exists(chunk_file):
+                    os.remove(chunk_file)
+            
+            gc.collect()
+            pbar.update(1)
     
-    # Process strips in parallel
-    max_strip_workers = mp.cpu_count()
-    _log.info(f'Processing {strips_per_height} strips with {max_strip_workers} workers')
-    
-    with mp.Pool(max_strip_workers) as pool:
-        with tqdm(total=strips_per_height, desc="Processing strips", unit="strip") as pbar:
-            for result in pool.imap(process_strip_worker, strips_to_process):
-                pbar.update(1)
-        pool.close()
-        pool.join()
-    
-    # Clean up temporary chunk files
-    _log.info('Cleaning up temporary chunk files')
-    for i in range(nc):
-        chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
-        if os.path.exists(chunk_file):
-            os.remove(chunk_file)
+    _log.info('All max-resolution tiles created')
     
     _log.info('Phase 2: Building pyramid levels')
     
