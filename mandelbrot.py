@@ -23,7 +23,7 @@ try:
     import image_processor
 except ImportError:
     print("Error: mandelbrot or image_processor module not found")
-    print("Please run 'python setup.py build_ext --inplace' to compile the C++ extensions")
+    print("Please run 'make' to compile the C++ extensions")
     sys.exit(1)
 
 _log = logging.getLogger('mandelbrot')
