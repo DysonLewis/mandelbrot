@@ -29,8 +29,8 @@ except ImportError:
 _log = logging.getLogger('mandelbrot')
 
 # Mandelbrot calculation parameters
-max_iter = 300
-r2_max = 1 << 16
+max_iter = 750
+r2_max = 1 << 18
 
 # Reference iteration count for color normalization
 # Colors will always match this scale regardless of max_iter
@@ -60,7 +60,7 @@ x = np.linspace(xmin, xmax, nx, endpoint=True)
 y = np.linspace(ymin, ymax, ny, endpoint=True)
 
 # DeepZoom tile size
-TILE_SIZE = 512
+TILE_SIZE = 256
 TILE_OVERLAP = 0
 
 # Setup for chunking the x-axis into columns

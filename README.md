@@ -48,25 +48,24 @@ DeepZoom creates a pyramid with tiles at multiple zoom levels. The Mandelbrot se
 
 | Scale | Resolution | DeepZoom Storage | Peak During Processing* |
 |-------|------------|------------------|------------------------|
-| 1x | 7,680 × 10,240 | ~2 MB | ~300 MB |
-| 4x | 30,720 × 40,960 | ~20 MB | ~1.2 GB |
-| 6x | 46,080 × 61,440 | ~40 MB | ~2.7 GB |
-| 8x | 61,440 × 81,920 | ~70 MB | ~4.8 GB |
-| 10x | 76,800 × 102,400 | ~110 MB | ~7.5 GB |
-| 20x | 153,600 × 204,800 | ~440 MB | ~30 GB |
+| 1x | 7,680 × 10,240 | ~2 MB | ~0.2 GB |
+| 4x | 30,720 × 40,960 | ~20 MB | ~3.6 GB |
+| 6x | 46,080 × 61,440 | ~40 MB | ~8.1 GB |
+| 8x | 61,440 × 81,920 | ~70 MB | ~14.4 GB |
+| 10x | 76,800 × 102,400 | ~110 MB | ~22.5 GB |
+| 20x | 153,600 × 204,800 | ~440 MB | ~90 GB |
 
 *Peak storage includes temporary `.npy` chunk files during processing, which are automatically deleted after tiles are generated.
 
 ### Processing Time
 
-On a typical multi-core system*:
+On a typical multi-core system:
 - 4x scale: ~5-10 minutes
 - 10x scale: ~30-45 minutes
 - 20x scale: ~2-3 hours
 
 Time scales with pixel count and number of CPU cores available.
 
-*very rough estimates
 ## Requirements
 
 ### Python Packages
