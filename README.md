@@ -38,36 +38,60 @@ The generator creates:
 - `mandelbrot_viewer.html` - Interactive web viewer
 - Automatic browser launch with local web server on port 8000
 
-## Performance & Storage
+## Quality of Life Features
 
-### Storage Requirements
+### Interactive Scale Selection
+
+When you run the generator, it will prompt you for a scale factor and show you:
+- **Final resolution** in pixels
+- **Estimated processing time** based on empirical measurements
+- **Peak temporary storage** needed during processing
+- **Final DeepZoom storage size** for the complete pyramid
+
+This allows you to make an informed decision before starting the generation process. The estimates are calculated using power-law models fitted to actual benchmark data:
+
+- **Processing time**: `t = 12.977 × scale^1.804` (in seconds)
+- **Final storage**: `size = 9.58017 × scale^1.69713` (in MB)
+
+### Performance & Storage Reference
 
 **Default resolution is 4x (30,720 × 40,960 pixels)**
 
 DeepZoom creates a pyramid with tiles at multiple zoom levels. The Mandelbrot set compresses extremely well due to large solid-color regions and smooth gradients, resulting in surprisingly small file sizes.
 
-| Scale | Resolution | DeepZoom Storage | Peak During Processing* |
-|-------|------------|------------------|------------------------|
-| 1x | 7,680 × 10,240 | ~2 MB | ~0.1 GB |
-| 4x | 30,720 × 40,960 | ~20 MB | ~0.3 GB |
-| 6x | 46,080 × 61,440 | ~40 MB | ~0.7 GB |
-| 8x | 61,440 × 81,920 | ~70 MB | ~1.2 GB |
-| 10x | 76,800 × 102,400 | ~110 MB | ~1.9 GB |
-| 20x | 153,600 × 204,800 | ~440 MB | ~7.5 GB |
+| Scale | Resolution | Processing Time* | Peak Temp Storage** | DeepZoom Storage*** |
+|-------|------------|------------------|---------------------|------------------|
+| 1x | 7,680 × 10,240 | ~13 sec | ~75 MB | ~10 MB |
+| 2x | 15,360 × 20,480 | ~45 sec | ~150 MB | ~31 MB |
+| 4x | 30,720 × 40,960 | ~3 min | ~300 MB | ~101 MB |
+| 6x | 46,080 × 61,440 | ~6 min | ~450 MB | ~196 MB |
+| 8x | 61,440 × 81,920 | ~11 min | ~600 MB | ~309 MB |
+| 10x | 76,800 × 102,400 | ~17 min | ~750 MB | ~441 MB |
+| 15x | 115,200 × 153,600 | ~44 min | ~1.1 GB | ~928 MB |
+| 20x | 153,600 × 204,800 | ~80 min | ~1.5 GB | ~1.5 GB |
+| 30x | 230,400 × 307,200 | ~3.2 hours | ~2.2 GB | ~3.2 GB |
+| 40x | 307,200 × 409,600 | ~5.5 hours | ~3.0 GB | ~5.3 GB |
+| 50x | 384,000 × 512,000 | ~8.5 hours | ~3.8 GB | ~7.8 GB |
 
-*Peak storage is now just one horizontal strip worth of temporary `.npy` chunk files (~64 files × 256 pixels high), which are immediately deleted after tile generation. This streaming approach dramatically reduces peak storage compared to storing the entire raw image.
+*Processing time measured on an 8-core/16-thread system (11th gen Intel I7) with 16GB of ram and a PCIEgen4x4 NVME SSD at 750 iterations.
 
-### Processing Time
+**Peak storage is just one horizontal strip worth of temporary `.npy` chunk files (~64 files × 256 pixels high), which are immediately deleted after tile generation. This streaming approach dramatically reduces peak storage compared to storing the entire raw image.
 
-On a modern multi-core system (e.g., 8-core/16-thread CPU with NVMe SSD):
-- 4x scale: ~2-3 minutes
-- 10x scale: ~10-15 minutes
-- 20x scale: ~35-45 minutes
+***Final storage past 20x is unverified.
+### Progress Tracking
 
-Time scales roughly linearly with pixel count. Performance depends heavily on:
-- CPU core count (more cores = faster parallel computation)
-- Storage speed (NVMe significantly faster than SATA SSD or HDD for temporary files)
-- Available RAM (reduces swapping during strip assembly)
+The generator provides real-time progress information:
+- **Strip-by-strip progress** showing overall completion
+- **Chunk processing within each strip** with nested progress bar
+- **Pyramid level generation** with tile count tracking
+- Clear visual indication of which phase is running
+
+### Automatic Cleanup
+
+Temporary files are deleted immediately after use:
+- Chunk `.npy` files are removed as soon as each strip's tiles are generated
+- Only the final DeepZoom pyramid and metadata files remain
+- No manual cleanup required
 
 ## Requirements
 
@@ -102,7 +126,7 @@ make
 python mandelbrot.py
 ```
 
-You'll be prompted to enter an image scale factor (press Enter for default 4x).
+You'll be prompted to enter an image scale factor (press Enter for default 4x). The generator will show you estimates for processing time, peak storage, and final file size before starting.
 
 The generator will:
 1. Process the image in horizontal strips (256 pixels high each)
