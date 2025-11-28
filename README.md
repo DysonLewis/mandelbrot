@@ -40,30 +40,33 @@ The generator creates:
 
 ## Performance & Storage
 
-### Approximate Storage Requirements
+### Storage Requirements
 
 **Default resolution is 4x (30,720 × 40,960 pixels)**
 
-DeepZoom creates a pyramid with tiles at multiple zoom levels, resulting in larger storage than single images but enabling smooth zooming.
+DeepZoom creates a pyramid with tiles at multiple zoom levels. The Mandelbrot set compresses extremely well due to large solid-color regions and smooth gradients, resulting in surprisingly small file sizes.
 
-| Scale | Resolution | Approximate Storage |
-|-------|------------|-------------------|
-| 1x | 7,680 × 10,240 | ~0.6 GB |
-| 4x | 30,720 × 40,960 | ~10 GB |
-| 8x | 61,440 × 81,920 | ~40 GB |
-| 10x | 76,800 × 102,400 | ~58 GB |
+| Scale | Resolution | DeepZoom Storage | Peak During Processing* |
+|-------|------------|------------------|------------------------|
+| 1x | 7,680 × 10,240 | ~2 MB | ~300 MB |
+| 4x | 30,720 × 40,960 | ~20 MB | ~1.2 GB |
+| 6x | 46,080 × 61,440 | ~40 MB | ~2.7 GB |
+| 8x | 61,440 × 81,920 | ~70 MB | ~4.8 GB |
+| 10x | 76,800 × 102,400 | ~110 MB | ~7.5 GB |
+| 20x | 153,600 × 204,800 | ~440 MB | ~30 GB |
 
-Storage scales roughly with pixel count. The pyramid structure adds ~33% overhead compared to storing only the highest resolution level.
+*Peak storage includes temporary `.npy` chunk files during processing, which are automatically deleted after tiles are generated.
 
 ### Processing Time
 
-On a typical multi-core system:
+On a typical multi-core system*:
 - 4x scale: ~5-10 minutes
 - 10x scale: ~30-45 minutes
 - 20x scale: ~2-3 hours
 
 Time scales with pixel count and number of CPU cores available.
 
+*very rough esstimates
 ## Requirements
 
 ### Python Packages
