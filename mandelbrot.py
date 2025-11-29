@@ -30,18 +30,22 @@ except ImportError:
     print("Please run 'make' to compile the C++ extensions")
     sys.exit(1)
 
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Force a carriage return and clear any tqdm artifacts
+            sys.stderr.write('\r\033[K' + msg + '\n')
+            sys.stderr.flush()
+        except Exception:
+            self.handleError(record)
+
 _log = logging.getLogger('mandelbrot')
 
-# Mandelbrot calculation parameters
 max_iter = 750
 r2_max = 1 << 18
-
-# Reference iteration count for color normalization
-# Colors will always match this scale regardless of max_iter
-# This only changes the color, tbh I just liked how it looks at 100
 color_reference = 100
 
-# Pause control state
 paused = mp.Value('i', 0)
 exit_confirm = mp.Value('i', 0)
 save_requested = mp.Value('i', 0)
@@ -49,11 +53,12 @@ pause_lock = threading.Lock()
 input_thread = None
 old_settings = None
 
-# Save file path
 SAVE_FILE = os.path.join(script_dir, 'mandelbrot_progress.json')
 
 def save_progress(im_scale, current_strip, total_strips):
-    '''Save current progress to JSON file'''
+    if os.path.exists(SAVE_FILE):
+        os.remove(SAVE_FILE)
+    
     progress_data = {
         'im_scale': im_scale,
         'current_strip': current_strip,
@@ -63,10 +68,8 @@ def save_progress(im_scale, current_strip, total_strips):
     }
     with open(SAVE_FILE, 'w') as f:
         json.dump(progress_data, f, indent=2)
-    _log.info(f'Progress saved: strip {current_strip}/{total_strips}')
 
 def load_progress():
-    '''Load progress from JSON file'''
     if not os.path.exists(SAVE_FILE):
         return None
     try:
@@ -76,7 +79,6 @@ def load_progress():
         return None
 
 def input_listener():
-    '''Background thread that listens for 'p' (pause), 's' (save), and 'e' (exit) key presses'''
     global old_settings
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -90,40 +92,32 @@ def input_listener():
                         if exit_confirm.value == 1:
                             exit_confirm.value = 0
                             paused.value = 0
-                            sys.stdout.write("\r\033[KExit cancelled - resuming")
-                            sys.stdout.flush()
+                            tqdm.write("\nExit cancelled - resuming")
                         elif paused.value == 0:
                             paused.value = 1
-                            sys.stdout.write("\r\033[KPause requested - will pause after current chunk/tile completes")
-                            sys.stdout.flush()
+                            tqdm.write("\nPause requested - will pause after current chunk completes")
                         else:
                             paused.value = 0
-                            sys.stdout.write("\r\033[KResuming")
-                            sys.stdout.flush()
+                            tqdm.write("\nResuming")
                 elif ch.lower() == 's':
                     with pause_lock:
                         if paused.value == 1:
                             save_requested.value = 1
-                            sys.stdout.write("\r\033[KSave requested")
-                            sys.stdout.flush()
+                            tqdm.write("\nSaving and exiting...")
                         else:
-                            sys.stdout.write("\r\033[KPause first (press 'p') before saving")
-                            sys.stdout.flush()
+                            tqdm.write("\nPause first (press 'p') before saving")
                 elif ch.lower() == 'e':
                     if exit_confirm.value == 1:
-                        sys.stdout.write("\r\033[KForce quit confirmed - exiting immediately")
-                        sys.stdout.flush()
+                        tqdm.write("\nForce quit confirmed - exiting immediately")
                         if old_settings:
                             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                         os._exit(0)
                     else:
                         exit_confirm.value = 1
                         paused.value = 1
-                        sys.stdout.write("\r\033[KPress 'e' again to force quit, or 'p' to cancel and resume")
-                        sys.stdout.flush()
+                        tqdm.write("\nPress 'e' again to force quit, or 'p' to cancel and resume")
                 elif ch == '\x03':
-                    sys.stdout.write("\r\033[KCtrl+C detected - exiting")
-                    sys.stdout.flush()
+                    tqdm.write("\nCtrl+C detected - exiting")
                     if old_settings:
                         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                     os._exit(0)
@@ -132,24 +126,15 @@ def input_listener():
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 def wait_if_paused():
-    '''Check if paused and wait until unpaused, handle save requests while paused'''
     if paused.value == 1 and exit_confirm.value == 0:
-        sys.stdout.write("\r\033[KPaused. Press 'p' to resume, 's' to save progress.")
-        sys.stdout.flush()
+        tqdm.write("\nPaused. Press 'p' to resume, 's' to save and exit.")
     while paused.value == 1:
-        # Check if save was requested while paused
         if save_requested.value == 1:
-            # We're between strips/chunks, so strip_idx is available in parent scope
-            # This will be checked after the wait loop ends
-            break
+            return True
         threading.Event().wait(0.1)
+    return False
 
-# Get image scale factor from user with time estimate
 def estimate_time(scale):
-    '''
-    Estimate processing time based on empirical formula: t = 12.977 × x^1.804
-    Function fit based on my machine timing running at 750 iterations 
-    '''
     time_seconds = 12.977 * (scale ** 1.804)
     time_minutes = time_seconds / 60
     
@@ -162,15 +147,7 @@ def estimate_time(scale):
         return f"{hours:.1f} hours"
 
 def estimate_storage(scale):
-    '''
-    Estimate storage requirements based on scale
-    Peak storage: one strip of chunks (256 pixels high × width × 64 chunks × 3 bytes)
-    Empirical formula from testing: peak ≈ 0.075 × scale GB
-    '''
     peak_gb = 0.075 * scale
-    
-    # Final DeepZoom storage (compressed PNGs)
-    # Power law formula fitted from empirical data
     final_mb = 9.58017 * (scale ** 1.69713)
     
     if peak_gb < 1:
@@ -185,25 +162,24 @@ def estimate_storage(scale):
     
     return peak_str, final_str
 
-# Check for saved progress
 saved_progress = load_progress()
 im_scale = None
 start_strip = 0
 
 if saved_progress:
-    print("\nSave found!")
+    print("\nSave Found!")
     print(f"Scale: {saved_progress['im_scale']}x")
     print(f"Progress: {saved_progress['current_strip']}/{saved_progress['total_strips']} strips")
     print(f"Completion: {(saved_progress['current_strip']/saved_progress['total_strips']*100):.1f}%")
+    print("Press 'r' to resume, or enter new scale to start fresh: ", end='', flush=True)
     
-    while True:
-        choice = input("\nPress 'r' to resume, or enter new scale to start fresh: ").strip().lower()
-        if choice == 'r':
-            im_scale = saved_progress['im_scale']
-            start_strip = saved_progress['current_strip']
-            print(f"\nResuming from strip {start_strip}")
-            break
-        else:
+    choice = input().strip().lower()
+    if choice == 'r':
+        im_scale = saved_progress['im_scale']
+        start_strip = saved_progress['current_strip']
+        print(f"\nResuming from strip {start_strip}")
+    else:
+        while True:
             try:
                 if choice == "":
                     im_scale = 4
@@ -211,6 +187,7 @@ if saved_progress:
                     im_scale = int(choice)
                     if im_scale <= 0:
                         print("Scale factor must be positive")
+                        choice = input("Press 'r' to resume, or enter new scale to start fresh: ").strip().lower()
                         continue
                 
                 confirm = input(f"Start fresh with scale {im_scale}x? This will overwrite the saved progress. (y/n): ").strip().lower()
@@ -219,8 +196,16 @@ if saved_progress:
                     if os.path.exists(SAVE_FILE):
                         os.remove(SAVE_FILE)
                     break
+                else:
+                    choice = input("Press 'r' to resume, or enter new scale to start fresh: ").strip().lower()
+                    if choice == 'r':
+                        im_scale = saved_progress['im_scale']
+                        start_strip = saved_progress['current_strip']
+                        print(f"\nResuming from strip {start_strip}")
+                        break
             except ValueError:
                 print("Please enter a valid integer or 'r' to resume")
+                choice = input("Press 'r' to resume, or enter new scale to start fresh: ").strip().lower()
 
 if im_scale is None:
     while True:
@@ -260,18 +245,15 @@ print("Press 'p' at any time to pause/resume")
 print("Press 's' while paused to save progress")
 print("Press 'e' twice within 3 seconds to force quit (or Ctrl+C)")
 
-# Define calculation domain and resolution
 xmin, xmax = -2.5, 1.
 ymin, ymax = -1., 1.
 ny, nx = im_scale*7680, im_scale*10240
 x = np.linspace(xmin, xmax, nx, endpoint=True)
 y = np.linspace(ymin, ymax, ny, endpoint=True)
 
-# DeepZoom tile size
 TILE_SIZE = 256
 TILE_OVERLAP = 0
 
-# Setup for chunking the x-axis into columns
 ncol = 64
 fx = nx//ncol
 nc = fx + (fx*ncol < nx)
@@ -280,23 +262,18 @@ ex = np.clip((np.arange(nc, dtype=int)+1)*ncol, 0, nx)
 
 
 def worker(input, output, lut_shared, color_max_shared):
-    '''Worker process that computes Mandelbrot values and converts to RGB'''
     lut = np.frombuffer(lut_shared, dtype=np.uint8).reshape(256, 3)
     color_max = color_max_shared.value
     
     for i, args in iter(input.get, 'STOP'):
         coldata = mandelbrot.calc_val(*args)
-        
-        # Convert to RGB in worker to reduce data transfer
         chunk_normalized = np.clip((coldata / color_max) * 255, 0, 255).astype(np.uint8)
         rgb_chunk = lut[chunk_normalized]
-        
         output.put((i, rgb_chunk))
         del coldata, chunk_normalized
 
 
 def feeder(input, strip_y_start, strip_y_end):
-    '''Feeder process that creates work chunks for a specific strip'''
     for i in range(nc):
         xx, yy = np.meshgrid(x[bx[i]:ex[i]], y[strip_y_start:strip_y_end])
         args = (xx, yy)
@@ -304,7 +281,6 @@ def feeder(input, strip_y_start, strip_y_end):
 
 
 def create_dzi_file(width, height, tile_size, tile_overlap, dzi_path):
-    '''Create the .dzi metadata file for DeepZoom'''
     dzi_content = f'''<?xml version="1.0" encoding="utf-8"?>
 <Image xmlns="http://schemas.microsoft.com/deepzoom/2008"
        Format="png"
@@ -318,7 +294,6 @@ def create_dzi_file(width, height, tile_size, tile_overlap, dzi_path):
 
 
 def save_tile(tile_data, level, col, row, tiles_dir):
-    '''Save a single tile as PNG'''
     level_dir = os.path.join(tiles_dir, str(level))
     os.makedirs(level_dir, exist_ok=True)
     
@@ -329,7 +304,6 @@ def save_tile(tile_data, level, col, row, tiles_dir):
 
 
 def get_level_dimensions(width, height, level, max_level):
-    '''Calculate dimensions at a given pyramid level'''
     scale = 2 ** (max_level - level)
     level_width = max(1, int(math.ceil(width / scale)))
     level_height = max(1, int(math.ceil(height / scale)))
@@ -337,13 +311,11 @@ def get_level_dimensions(width, height, level, max_level):
 
 
 def downsample_tile_worker(args):
-    '''Worker function to create one downsampled tile from 2x2 source tiles'''
     level, tile_col, tile_row, tiles_dir, source_level = args
     
     source_tile_col = tile_col * 2
     source_tile_row = tile_row * 2
     
-    # Load up to 4 source tiles and combine into 512x512 image
     combined = np.zeros((TILE_SIZE * 2, TILE_SIZE * 2, 3), dtype=np.uint8)
     
     for dy in range(2):
@@ -362,7 +334,6 @@ def downsample_tile_worker(args):
                 combined[y_start:y_start + tile_array.shape[0], 
                         x_start:x_start + tile_array.shape[1], :] = tile_array
     
-    # Downsample using C++ Lanczos implementation
     downsampled = image_processor.downsample_tile(combined)
     del combined
     
@@ -373,21 +344,21 @@ def downsample_tile_worker(args):
 
 if __name__ == '__main__':
     
-    logging.basicConfig(level=logging.DEBUG,
-                        format='%(name)-12s: %(levelname)-8s %(message)s',
-                        )
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    
+    handler = TqdmLoggingHandler()
+    handler.setFormatter(logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s'))
+    logger.addHandler(handler)
     
     logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
     logging.getLogger('PIL').setLevel(logging.WARNING)
 
-    # Start background thread to listen for key presses
     input_thread = threading.Thread(target=input_listener, daemon=True)
     input_thread.start()
 
     _log.info(f'Generating Mandelbrot set at {ny} x {nx} resolution')
     
-    # Setup colormap early so workers can use it
-    # VScode is great I could just select a color on the graph thingy
     colors = ["#10001F", "#1A0E36", "#001E71", "#007D7D", "#006C7F", 
               "#00B129", "#F2FF00", "#FF6600", "#D60000", "#757575FF"]
     n_bins = 256
@@ -395,11 +366,9 @@ if __name__ == '__main__':
     lut = (cmap(np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
     color_max = float(color_reference)
     
-    # Share colormap with workers via shared memory
     lut_shared = mp.Array('B', lut.flatten(), lock=False)
     color_max_shared = mp.Value('d', color_max, lock=False)
     
-    # Setup DeepZoom directory structure
     dz_dir = os.path.join(script_dir, 'mandelbrot_deepzoom')
     tiles_dir = dz_dir + '_files'
     
@@ -412,45 +381,39 @@ if __name__ == '__main__':
     else:
         _log.info(f'Resuming - using existing DeepZoom directory: {tiles_dir}')
     
-    # Calculate max pyramid level
     max_level = int(math.ceil(math.log(max(nx, ny), 2)))
     _log.info(f'DeepZoom pyramid will have {max_level + 1} levels')
     
-    # Calculate strip parameters
     strips_per_height = int(math.ceil(ny / TILE_SIZE))
     
     _log.info(f'Processing image in {strips_per_height} strips')
     
-    # Setup multiprocessing queues and processes
     n_process = mp.cpu_count()
     n_max = n_process*2
     
     level_dir = os.path.join(tiles_dir, str(max_level))
     os.makedirs(level_dir, exist_ok=True)
     
-    # Process one strip at a time
-    with tqdm(total=strips_per_height, desc="Processing strips", unit="strip", position=0, initial=start_strip) as strip_pbar:
+    saved_and_exited = False
+    with tqdm(total=strips_per_height, desc="Processing strips", unit="strip", position=0, initial=start_strip, 
+              dynamic_ncols=True, leave=True) as strip_pbar:
         for strip_idx in range(start_strip, strips_per_height):
             strip_y_start = strip_idx * TILE_SIZE
             strip_y_end = min((strip_idx + 1) * TILE_SIZE, ny)
             strip_height = strip_y_end - strip_y_start
             
-            # Create fresh queues for this strip
             inqueue = mp.Queue(n_max)
             outqueue = mp.Queue(n_max)
             
-            # Start worker processes for this strip
             workers = []
             for i in range(n_process):
                 p = mp.Process(target=worker, args=(inqueue, outqueue, lut_shared, color_max_shared))
                 p.start()
                 workers.append(p)
             
-            # Start feeder process for this strip
             feedp = mp.Process(target=feeder, args=(inqueue, strip_y_start, strip_y_end))
             feedp.start()
             
-            # Collect chunks and save as temporary .npy files with nested progress bar
             chunk_files = []
             chunks_completed = 0
             with tqdm(total=nc, desc=f"  Strip {strip_idx+1}/{strips_per_height} chunks", 
@@ -458,7 +421,6 @@ if __name__ == '__main__':
                 for j in range(nc):
                     i, rgb_chunk = outqueue.get()
                     
-                    # Save chunk temporarily
                     chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
                     np.save(chunk_file, rgb_chunk)
                     chunk_files.append((i, chunk_file))
@@ -470,97 +432,123 @@ if __name__ == '__main__':
                     if (j + 1) % 10 == 0:
                         gc.collect()
                     
-                    # Check for pause after completing chunk
-                    wait_if_paused()
+                    should_save = wait_if_paused()
                     
-                    # If save was requested while paused, save immediately and exit inner loop
-                    if save_requested.value == 1:
+                    if should_save:
+                        for p in workers:
+                            p.terminate()
+                        feedp.terminate()
+                        
+                        for i in range(nc):
+                            chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+                            if os.path.exists(chunk_file):
+                                os.remove(chunk_file)
+                        
+                        save_progress(im_scale, strip_idx, strips_per_height)
+                        save_requested.value = 0
+                        saved_and_exited = True
+                        tqdm.write(f"\nSaved! Run again and press 'r' to resume from strip {strip_idx}/{strips_per_height}.")
                         break
             
-            # If save was requested mid-strip, handle partial completion
-            if save_requested.value == 1 and chunks_completed < nc:
-                # Clean up workers
+            if saved_and_exited:
+                break
+            
+            if save_requested.value == 1:
+                _log.info('Save requested - completing current strip before saving')
+                
                 for i in range(n_process):
                     inqueue.put('STOP')
                 for p in workers:
-                    p.terminate()
                     p.join()
-                feedp.terminate()
-                feedp.join()
+                feedp.join(1.)
                 
-                # Clean up partial chunks
+                strip_buffer = np.zeros((strip_height, nx, 3), dtype=np.uint8)
+                
+                for i in range(nc):
+                    chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+                    chunk_mmap = np.load(chunk_file, mmap_mode='r')
+                    strip_buffer[:, bx[i]:ex[i], :] = chunk_mmap[:, :, :]
+                    del chunk_mmap
+                
+                strip_buffer = image_processor.flip_vertical(strip_buffer)
+                tiles = image_processor.split_into_tiles(strip_buffer, TILE_SIZE)
+                del strip_buffer
+                
+                tile_row = strips_per_height - 1 - strip_idx
+                for tile_x_idx, tile_data in enumerate(tiles):
+                    save_tile(tile_data, max_level, tile_x_idx, tile_row, tiles_dir)
+                
+                del tiles
+                
                 for i in range(nc):
                     chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
                     if os.path.exists(chunk_file):
                         os.remove(chunk_file)
                 
-                # Save progress at current strip (not completed)
-                save_progress(im_scale, strip_idx, strips_per_height)
-                save_requested.value = 0
-                paused.value = 0
-                sys.stdout.write("\r\033[KProgress saved at strip {}/{}! Generation will continue from here next time.\n".format(strip_idx, strips_per_height))
-                sys.stdout.flush()
+                gc.collect()
+                strip_pbar.update(1)
                 
-                # Exit the strip loop
-                break
-            
-            # Clean up workers for this strip
-            for i in range(n_process):
-                inqueue.put('STOP')
-            for p in workers:
-                p.join()
-            feedp.join(1.)
-            
-            # Build strip from chunks (using mmap to avoid loading everything)
-            strip_buffer = np.zeros((strip_height, nx, 3), dtype=np.uint8)
-            
-            for i in range(nc):
-                chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
-                # Memory-map the chunk file to avoid loading entire chunk
-                chunk_mmap = np.load(chunk_file, mmap_mode='r')
-                strip_buffer[:, bx[i]:ex[i], :] = chunk_mmap[:, :, :]
-                del chunk_mmap
-            
-            # Flip vertically using C++ extension
-            strip_buffer = image_processor.flip_vertical(strip_buffer)
-            
-            # Split into tiles using C++ extension
-            tiles = image_processor.split_into_tiles(strip_buffer, TILE_SIZE)
-            del strip_buffer
-            
-            # Save tiles for this strip
-            tile_row = strips_per_height - 1 - strip_idx
-            for tile_x_idx, tile_data in enumerate(tiles):
-                save_tile(tile_data, max_level, tile_x_idx, tile_row, tiles_dir)
-            
-            del tiles
-            
-            # Delete temporary chunk files for this strip
-            for i in range(nc):
-                chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
-                if os.path.exists(chunk_file):
-                    os.remove(chunk_file)
-            
-            gc.collect()
-            strip_pbar.update(1)
-            
-            # Check if save was requested at end of strip
-            if save_requested.value == 1:
                 save_progress(im_scale, strip_idx + 1, strips_per_height)
                 save_requested.value = 0
-                paused.value = 0  # Unpause after saving
-                sys.stdout.write("\r\033[KProgress saved at strip {}/{}! Generation will continue from here next time.\n".format(strip_idx + 1, strips_per_height))
-                sys.stdout.flush()
+                paused.value = 0
+                saved_and_exited = True
+                tqdm.write(f"\nProgress saved! Run again and press 'r' to resume from strip {strip_idx + 1}/{strips_per_height}.")
                 break
             
-            # Check for pause after completing strip
-            wait_if_paused()
+            if save_requested.value == 0:
+                for i in range(n_process):
+                    inqueue.put('STOP')
+                for p in workers:
+                    p.join()
+                feedp.join(1.)
+            
+            if save_requested.value == 0:
+                strip_buffer = np.zeros((strip_height, nx, 3), dtype=np.uint8)
+                
+                for i in range(nc):
+                    chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+                    chunk_mmap = np.load(chunk_file, mmap_mode='r')
+                    strip_buffer[:, bx[i]:ex[i], :] = chunk_mmap[:, :, :]
+                    del chunk_mmap
+                
+                strip_buffer = image_processor.flip_vertical(strip_buffer)
+                tiles = image_processor.split_into_tiles(strip_buffer, TILE_SIZE)
+                del strip_buffer
+                
+                tile_row = strips_per_height - 1 - strip_idx
+                for tile_x_idx, tile_data in enumerate(tiles):
+                    save_tile(tile_data, max_level, tile_x_idx, tile_row, tiles_dir)
+                
+                del tiles
+                
+                for i in range(nc):
+                    chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+                    if os.path.exists(chunk_file):
+                        os.remove(chunk_file)
+                
+                gc.collect()
+                strip_pbar.update(1)
+                
+                if save_requested.value == 1:
+                    save_progress(im_scale, strip_idx + 1, strips_per_height)
+                    save_requested.value = 0
+                    paused.value = 0
+                    saved_and_exited = True
+                    tqdm.write(f"\nProgress saved at strip {strip_idx + 1}/{strips_per_height}! Generation will continue from here next time.")
+                    break
+                
+                wait_if_paused()
+    
+    if saved_and_exited:
+        _log.info('Generation paused and saved. Run again and press "r" to resume.')
+        if old_settings:
+            fd = sys.stdin.fileno()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        sys.exit(0)
     
     _log.info('All max-resolution tiles created')
-    
     _log.info('Phase 2: Building pyramid levels')
     
-    # Build pyramid from max_level down to 0
     for level in range(max_level - 1, -1, -1):
         source_level = level + 1
         
@@ -575,36 +563,29 @@ if __name__ == '__main__':
         level_dir = os.path.join(tiles_dir, str(level))
         os.makedirs(level_dir, exist_ok=True)
         
-        # Create list of all tiles to process for this level
         tiles_to_process = []
         for tile_row in range(tiles_high):
             for tile_col in range(tiles_wide):
                 tiles_to_process.append((level, tile_col, tile_row, tiles_dir, source_level))
         
-        # Process tiles in parallel with pause support
         max_tile_workers = mp.cpu_count() * 2
         
         with mp.Pool(max_tile_workers) as pool:
             with tqdm(total=len(tiles_to_process), desc=f"Level {level}", unit="tile") as pbar:
                 for result in pool.imap_unordered(downsample_tile_worker, tiles_to_process):
                     pbar.update(1)
-                    # Check for pause after completing each tile
                     wait_if_paused()
             pool.close()
             pool.join()
     
-    # Create .dzi file
     dzi_path = dz_dir + '.dzi'
     create_dzi_file(nx, ny, TILE_SIZE, TILE_OVERLAP, dzi_path)
     _log.info(f'Created .dzi file: {dzi_path}')
     
-    # Remove save file since we completed successfully
     if os.path.exists(SAVE_FILE):
         os.remove(SAVE_FILE)
         _log.info('Removed save file (generation complete)')
     
-    # Generate HTML viewer for DeepZoom
-    # Lowk had to look this up, idk if it's any good
     _log.info('Generating HTML viewer')
     html_content = f"""<!DOCTYPE html>
 <html>
@@ -672,7 +653,6 @@ if __name__ == '__main__':
     _log.info(f'HTML viewer created: {html_fn}')
     _log.info(f'Open {html_fn} in your browser to view the Mandelbrot set')
 
-    # Start local web server and open browser
     _log.info('Starting local web server')
     PORT = 8000
     
@@ -707,7 +687,6 @@ if __name__ == '__main__':
         _log.info(f'You can manually run: python3 -m http.server {PORT}')
         _log.info(f'Then open: http://localhost:{PORT}/mandelbrot_viewer.html')
     finally:
-        # Restore terminal settings on exit
         if old_settings:
             fd = sys.stdin.fileno()
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
