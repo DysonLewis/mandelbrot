@@ -17,6 +17,7 @@ from tqdm import tqdm
 import select
 import termios
 import tty
+import json
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
@@ -43,12 +44,39 @@ color_reference = 100
 # Pause control state
 paused = mp.Value('i', 0)
 exit_confirm = mp.Value('i', 0)
+save_requested = mp.Value('i', 0)
 pause_lock = threading.Lock()
 input_thread = None
 old_settings = None
 
+# Save file path
+SAVE_FILE = os.path.join(script_dir, 'mandelbrot_progress.json')
+
+def save_progress(im_scale, current_strip, total_strips):
+    '''Save current progress to JSON file'''
+    progress_data = {
+        'im_scale': im_scale,
+        'current_strip': current_strip,
+        'total_strips': total_strips,
+        'max_iter': max_iter,
+        'color_reference': color_reference
+    }
+    with open(SAVE_FILE, 'w') as f:
+        json.dump(progress_data, f, indent=2)
+    _log.info(f'Progress saved: strip {current_strip}/{total_strips}')
+
+def load_progress():
+    '''Load progress from JSON file'''
+    if not os.path.exists(SAVE_FILE):
+        return None
+    try:
+        with open(SAVE_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return None
+
 def input_listener():
-    '''Background thread that listens for 'p' (pause) and 'e' (exit) key presses'''
+    '''Background thread that listens for 'p' (pause), 's' (save), and 'e' (exit) key presses'''
     global old_settings
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -71,6 +99,15 @@ def input_listener():
                         else:
                             paused.value = 0
                             sys.stdout.write("\r\033[KResuming")
+                            sys.stdout.flush()
+                elif ch.lower() == 's':
+                    with pause_lock:
+                        if paused.value == 1:
+                            save_requested.value = 1
+                            sys.stdout.write("\r\033[KSave requested")
+                            sys.stdout.flush()
+                        else:
+                            sys.stdout.write("\r\033[KPause first (press 'p') before saving")
                             sys.stdout.flush()
                 elif ch.lower() == 'e':
                     if exit_confirm.value == 1:
@@ -95,11 +132,16 @@ def input_listener():
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 def wait_if_paused():
-    '''Check if paused and wait until unpaused'''
+    '''Check if paused and wait until unpaused, handle save requests while paused'''
     if paused.value == 1 and exit_confirm.value == 0:
-        sys.stdout.write("\r\033[KPaused. Press 'p' to resume.")
+        sys.stdout.write("\r\033[KPaused. Press 'p' to resume, 's' to save progress.")
         sys.stdout.flush()
     while paused.value == 1:
+        # Check if save was requested while paused
+        if save_requested.value == 1:
+            # We're between strips/chunks, so strip_idx is available in parent scope
+            # This will be checked after the wait loop ends
+            break
         threading.Event().wait(0.1)
 
 # Get image scale factor from user with time estimate
@@ -143,40 +185,79 @@ def estimate_storage(scale):
     
     return peak_str, final_str
 
-while True:
-    try:
-        im_scale_input = input("Enter image scale factor (default 4): ").strip()
-        if im_scale_input == "":
-            im_scale = 4
-        else:
-            im_scale = int(im_scale_input)
-            if im_scale <= 0:
-                print("Scale factor must be positive")
-                continue
-        
-        ny_calc = im_scale * 7680
-        nx_calc = im_scale * 10240
-        estimated_time = estimate_time(im_scale)
-        peak_storage, final_storage = estimate_storage(im_scale)
-        
-        print(f"\nScale {im_scale}x:")
-        print(f"  Resolution: {ny_calc:,} × {nx_calc:,} pixels")
-        print(f"  Estimated time: {estimated_time}")
-        print(f"  Peak temp storage: {peak_storage}")
-        print(f"  Final DeepZoom size: {final_storage}")
-        
-        confirm = input("Continue with this scale? (y/n): ").strip().lower()
-        if confirm in ['y', 'yes']:
+# Check for saved progress
+saved_progress = load_progress()
+im_scale = None
+start_strip = 0
+
+if saved_progress:
+    print("\nSave found!")
+    print(f"Scale: {saved_progress['im_scale']}x")
+    print(f"Progress: {saved_progress['current_strip']}/{saved_progress['total_strips']} strips")
+    print(f"Completion: {(saved_progress['current_strip']/saved_progress['total_strips']*100):.1f}%")
+    
+    while True:
+        choice = input("\nPress 'r' to resume, or enter new scale to start fresh: ").strip().lower()
+        if choice == 'r':
+            im_scale = saved_progress['im_scale']
+            start_strip = saved_progress['current_strip']
+            print(f"\nResuming from strip {start_strip}")
             break
         else:
-            print("Let's try a different scale.\n")
-            continue
+            try:
+                if choice == "":
+                    im_scale = 4
+                else:
+                    im_scale = int(choice)
+                    if im_scale <= 0:
+                        print("Scale factor must be positive")
+                        continue
+                
+                confirm = input(f"Start fresh with scale {im_scale}x? This will overwrite the saved progress. (y/n): ").strip().lower()
+                if confirm in ['y', 'yes']:
+                    start_strip = 0
+                    if os.path.exists(SAVE_FILE):
+                        os.remove(SAVE_FILE)
+                    break
+            except ValueError:
+                print("Please enter a valid integer or 'r' to resume")
+
+if im_scale is None:
+    while True:
+        try:
+            im_scale_input = input("Enter image scale factor (default 4): ").strip()
+            if im_scale_input == "":
+                im_scale = 4
+            else:
+                im_scale = int(im_scale_input)
+                if im_scale <= 0:
+                    print("Scale factor must be positive")
+                    continue
             
-    except ValueError:
-        print("Please enter a valid integer")
+            ny_calc = im_scale * 7680
+            nx_calc = im_scale * 10240
+            estimated_time = estimate_time(im_scale)
+            peak_storage, final_storage = estimate_storage(im_scale)
+            
+            print(f"\nScale {im_scale}x:")
+            print(f"  Resolution: {ny_calc:,} × {nx_calc:,} pixels")
+            print(f"  Estimated time: {estimated_time}")
+            print(f"  Peak temp storage: {peak_storage}")
+            print(f"  Final DeepZoom size: {final_storage}")
+            
+            confirm = input("Continue with this scale? (y/n): ").strip().lower()
+            if confirm in ['y', 'yes']:
+                break
+            else:
+                print("Let's try a different scale.\n")
+                continue
+                
+        except ValueError:
+            print("Please enter a valid integer")
 
 print(f"\nStarting generation at {im_scale}x scale")
 print("Press 'p' at any time to pause/resume")
+print("Press 's' while paused to save progress")
 print("Press 'e' twice within 3 seconds to force quit (or Ctrl+C)")
 
 # Define calculation domain and resolution
@@ -299,7 +380,7 @@ if __name__ == '__main__':
     logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
     logging.getLogger('PIL').setLevel(logging.WARNING)
 
-    # Start background thread to listen for 'p' key press
+    # Start background thread to listen for key presses
     input_thread = threading.Thread(target=input_listener, daemon=True)
     input_thread.start()
 
@@ -322,11 +403,14 @@ if __name__ == '__main__':
     dz_dir = os.path.join(script_dir, 'mandelbrot_deepzoom')
     tiles_dir = dz_dir + '_files'
     
-    if os.path.exists(tiles_dir):
-        _log.info(f'Removing existing DeepZoom directory: {tiles_dir}')
-        shutil.rmtree(tiles_dir)
-    
-    os.makedirs(tiles_dir, exist_ok=True)
+    if start_strip == 0:
+        if os.path.exists(tiles_dir):
+            _log.info(f'Removing existing DeepZoom directory: {tiles_dir}')
+            shutil.rmtree(tiles_dir)
+        
+        os.makedirs(tiles_dir, exist_ok=True)
+    else:
+        _log.info(f'Resuming - using existing DeepZoom directory: {tiles_dir}')
     
     # Calculate max pyramid level
     max_level = int(math.ceil(math.log(max(nx, ny), 2)))
@@ -345,8 +429,8 @@ if __name__ == '__main__':
     os.makedirs(level_dir, exist_ok=True)
     
     # Process one strip at a time
-    with tqdm(total=strips_per_height, desc="Processing strips", unit="strip", position=0) as strip_pbar:
-        for strip_idx in range(strips_per_height):
+    with tqdm(total=strips_per_height, desc="Processing strips", unit="strip", position=0, initial=start_strip) as strip_pbar:
+        for strip_idx in range(start_strip, strips_per_height):
             strip_y_start = strip_idx * TILE_SIZE
             strip_y_end = min((strip_idx + 1) * TILE_SIZE, ny)
             strip_height = strip_y_end - strip_y_start
@@ -368,6 +452,7 @@ if __name__ == '__main__':
             
             # Collect chunks and save as temporary .npy files with nested progress bar
             chunk_files = []
+            chunks_completed = 0
             with tqdm(total=nc, desc=f"  Strip {strip_idx+1}/{strips_per_height} chunks", 
                      unit="chunk", position=1, leave=False) as chunk_pbar:
                 for j in range(nc):
@@ -380,12 +465,44 @@ if __name__ == '__main__':
                     
                     del rgb_chunk
                     chunk_pbar.update(1)
+                    chunks_completed += 1
                     
                     if (j + 1) % 10 == 0:
                         gc.collect()
                     
                     # Check for pause after completing chunk
                     wait_if_paused()
+                    
+                    # If save was requested while paused, save immediately and exit inner loop
+                    if save_requested.value == 1:
+                        break
+            
+            # If save was requested mid-strip, handle partial completion
+            if save_requested.value == 1 and chunks_completed < nc:
+                # Clean up workers
+                for i in range(n_process):
+                    inqueue.put('STOP')
+                for p in workers:
+                    p.terminate()
+                    p.join()
+                feedp.terminate()
+                feedp.join()
+                
+                # Clean up partial chunks
+                for i in range(nc):
+                    chunk_file = os.path.join(tiles_dir, f'temp_chunk_{i:04d}.npy')
+                    if os.path.exists(chunk_file):
+                        os.remove(chunk_file)
+                
+                # Save progress at current strip (not completed)
+                save_progress(im_scale, strip_idx, strips_per_height)
+                save_requested.value = 0
+                paused.value = 0
+                sys.stdout.write("\r\033[KProgress saved at strip {}/{}! Generation will continue from here next time.\n".format(strip_idx, strips_per_height))
+                sys.stdout.flush()
+                
+                # Exit the strip loop
+                break
             
             # Clean up workers for this strip
             for i in range(n_process):
@@ -426,6 +543,18 @@ if __name__ == '__main__':
             
             gc.collect()
             strip_pbar.update(1)
+            
+            # Check if save was requested at end of strip
+            if save_requested.value == 1:
+                save_progress(im_scale, strip_idx + 1, strips_per_height)
+                save_requested.value = 0
+                paused.value = 0  # Unpause after saving
+                sys.stdout.write("\r\033[KProgress saved at strip {}/{}! Generation will continue from here next time.\n".format(strip_idx + 1, strips_per_height))
+                sys.stdout.flush()
+                break
+            
+            # Check for pause after completing strip
+            wait_if_paused()
     
     _log.info('All max-resolution tiles created')
     
@@ -468,6 +597,11 @@ if __name__ == '__main__':
     dzi_path = dz_dir + '.dzi'
     create_dzi_file(nx, ny, TILE_SIZE, TILE_OVERLAP, dzi_path)
     _log.info(f'Created .dzi file: {dzi_path}')
+    
+    # Remove save file since we completed successfully
+    if os.path.exists(SAVE_FILE):
+        os.remove(SAVE_FILE)
+        _log.info('Removed save file (generation complete)')
     
     # Generate HTML viewer for DeepZoom
     # Lowk had to look this up, idk if it's any good
